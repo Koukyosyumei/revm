@@ -111,7 +111,7 @@ impl FromStr for W256 {
       .map_err(|_| "Failed to parse the first 32 characters as u128".to_string())?;
     let low = u128::from_str_radix(&padded[32..64], 16)
       .map_err(|_| "Failed to parse the last 32 characters as u128".to_string())?;
-    Ok(W256(high, low))
+    Ok(W256(low, high))
   }
 }
 
@@ -201,9 +201,9 @@ impl Add for W256 {
   type Output = W256;
 
   fn add(self, other: W256) -> W256 {
-    let (low, carry) = self.1.overflowing_add(other.1);
-    let (high, _) = self.0.overflowing_add(other.0 + if carry { 1 } else { 0 });
-    W256(high, low)
+    let (low, carry) = self.0.overflowing_add(other.0);
+    let (high, _) = self.1.overflowing_add(other.1 + if carry { 1 } else { 0 });
+    W256(low, high)
   }
 }
 
@@ -211,9 +211,9 @@ impl Sub for W256 {
   type Output = W256;
 
   fn sub(self, other: W256) -> W256 {
-    let (low, borrow) = self.1.overflowing_sub(other.1);
-    let (high, _) = self.0.overflowing_sub(other.0 + if borrow { 1 } else { 0 });
-    W256(high, low)
+    let (low, borrow) = self.0.overflowing_sub(other.0);
+    let (high, _) = self.1.overflowing_sub(other.1 + if borrow { 1 } else { 0 });
+    W256(low, high)
   }
 }
 
@@ -229,10 +229,10 @@ impl Mul for W256 {
   type Output = W256;
 
   fn mul(self, other: W256) -> W256 {
-    let self_low = self.1;
-    let self_high = self.0;
-    let other_low = other.1;
-    let other_high = other.0;
+    let self_low = self.0;
+    let self_high = self.1;
+    let other_low = other.0;
+    let other_high = other.1;
 
     let low_low = self_low.wrapping_mul(other_low);
     let high_low = self_high.wrapping_mul(other_low);
@@ -242,7 +242,7 @@ impl Mul for W256 {
     let low = low_low;
     let high = high_low.wrapping_add(low_high).wrapping_add(high_high);
 
-    W256(high, low)
+    W256(low, high)
   }
 }
 
@@ -320,34 +320,6 @@ impl W256 {
   pub fn one() -> W256 {
     W256(1, 0)
   }
-
-  pub fn shl(self, shift: u32) -> W256 {
-    if shift == 0 {
-      self
-    } else if shift < 128 {
-      let low = self.0 << shift;
-      let high = (self.1 << shift) | (self.0 >> (128 - shift));
-      W256(low, high)
-    } else {
-      let low = 0;
-      let high = self.0 << (shift - 128);
-      W256(low, high)
-    }
-  }
-
-  pub fn shr(self, shift: u32) -> W256 {
-    if shift == 0 {
-      self
-    } else if shift < 128 {
-      let high = self.1 >> shift;
-      let low = (self.0 >> shift) | (self.1 << (128 - shift));
-      W256(low, high)
-    } else {
-      let high = 0;
-      let low = self.1 >> (shift - 128);
-      W256(low, high)
-    }
-  }
 }
 
 impl Div for W256 {
@@ -366,23 +338,39 @@ impl Rem for W256 {
   }
 }
 
-impl Shr<u32> for W256 {
-  type Output = W256;
-
-  fn shr(self, rhs: u32) -> W256 {
-    let (high_shifted, low_shifted) =
-      if rhs >= 128 { (self.1 >> (rhs - 128), 0) } else { (self.0 >> rhs | self.1 << (128 - rhs), self.1 >> rhs) };
-    W256(high_shifted, low_shifted)
-  }
-}
-
 impl Shl<u32> for W256 {
   type Output = W256;
 
-  fn shl(self, rhs: u32) -> W256 {
-    let (high_shifted, low_shifted) =
-      if rhs >= 128 { (self.1 << (rhs - 128), 0) } else { (self.0 << rhs | self.1 >> (128 - rhs), self.1 << rhs) };
-    W256(high_shifted, low_shifted)
+  fn shl(self, shift: u32) -> W256 {
+    if shift == 0 {
+      self
+    } else if shift < 128 {
+      let low = self.0 << shift;
+      let high = (self.1 << shift) | (self.0 >> (128 - shift));
+      W256(low, high)
+    } else {
+      let low = 0;
+      let high = self.0 << (shift - 128);
+      W256(low, high)
+    }
+  }
+}
+
+impl Shr<u32> for W256 {
+  type Output = W256;
+
+  fn shr(self, shift: u32) -> W256 {
+    if shift == 0 {
+      self
+    } else if shift < 128 {
+      let high = self.1 >> shift;
+      let low = (self.0 >> shift) | (self.1 << (128 - shift));
+      W256(low, high)
+    } else {
+      let high = 0;
+      let low = self.1 >> (shift - 128);
+      W256(low, high)
+    }
   }
 }
 
@@ -1969,7 +1957,7 @@ pub fn word256_bytes(w256: W256) -> Vec<u8> {
   buffer.write_u128(b);
 
   buffer*/
-  let W256(high, low) = w256;
+  let W256(low, high) = w256;
   let mut buffer = Vec::with_capacity(32);
   buffer.extend_from_slice(&high.to_be_bytes());
   buffer.extend_from_slice(&low.to_be_bytes());

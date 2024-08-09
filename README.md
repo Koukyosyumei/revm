@@ -7,16 +7,53 @@
 > [!CAUTION]
 > Currently, this project is a work in progress.
 
-## install
+## 1. Install
 
-Ensure you have Rust installed on your machine. Then, build and install rhoevm using the following commands:
+### Prerequisites
+
+Rust: Ensure you have Rust installed. You can download it from [rust-lang.org](https://www.rust-lang.org/).
+Cargo: Rust's package manager should be installed with Rust.
+
+### Building from Source
+
+Clone the repository and build the project using Cargo:
 
 ```bash
+git clone https://github.com/Koukyosyumei/rhoevm.git
+cd rhoevm
 cargo build --release
 # sudo cp ./target/release/rhoevm /usr/local/bin/rhoevm
 ```
 
-## usage
+### Running Tests
+
+Run tests to verify the installation:
+
+```bash
+cargo test
+```
+
+## 2. Usage
+
+### Command-Line Interface
+
+`rhoevm` is operated via the command line. The general syntax is as follows:
+
+```bash
+rhoevm CONTRACT_NAME FUNCTION_NAMES [options]
+```
+
+- Options
+
+```
+-d, --dir DIR: Specify the target directory where contract files are located.
+-v, --verbose LEVEL: Set the verbosity level (0: error, 1: warn, 2: info, 3: debug, 4: trace).
+-h, --help: Display help information.
+```
+
+Ensure that your environment is configured to locate the `.bin` and `.abi` files for the contracts. The filenames should match the contract name provided.
+
+### Example
 
 Below is an example of how to use rhoevm with a simple Solidity smart contract.
 
@@ -41,7 +78,7 @@ contract AssertInput {
 # Compile the Solidity contract using solc or any preferred compiler.
 # Assuming the compiled binary and ABI are located in ./example/build
 
-$ RUST_LOG=info rhoevm ./example/build/AssertInput "check"
+$ rhoevm ./example/build/AssertInput "check"
 ```
 
 - Output

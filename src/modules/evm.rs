@@ -18,8 +18,8 @@ use crate::modules::op::{get_op, op_size, op_string, Op};
 use crate::modules::smt::{assert_props, format_smt2};
 use crate::modules::types::{
   from_list, keccak, keccak_prime, len_buf, maybe_lit_addr, maybe_lit_byte, maybe_lit_word, pad_left_prime, pad_right,
-  unbox, word256_bytes, word32, Addr, BaseState, Block, ByteString, Cache, CodeLocation, Contract, ContractCode, Env,
-  EvmError, Expr, ExprSet, ForkState, Frame, FrameContext, FrameState, Gas, Memory, MutableMemory, PartialExec, Prop,
+  unbox, word256_bytes, Addr, BaseState, Block, ByteString, Cache, CodeLocation, Contract, ContractCode, Env, EvmError,
+  Expr, ExprSet, ForkState, Frame, FrameContext, FrameState, Gas, Memory, MutableMemory, PartialExec, Prop,
   RuntimeCodeStruct, RuntimeConfig, SubState, Trace, TraceData, TxState, VMOpts, VMResult, W256W256Map, VM, W256, W64,
 };
 
@@ -241,10 +241,10 @@ impl VM {
         // call to precompile
         let calldatasize = len_buf(&self.state.calldata);
         copy_bytes_to_memory(
-          *self.state.calldata.clone(),
-          Expr::Lit(W256(calldatasize as u128, 0)),
-          Expr::Lit(W256(0, 0)),
-          Expr::Lit(W256(0, 0)),
+          self.state.calldata.clone(),
+          Box::new(Expr::Lit(W256(calldatasize as u128, 0))),
+          Box::new(Expr::Lit(W256(0, 0))),
+          Box::new(Expr::Lit(W256(0, 0))),
           self,
         );
         execute_precompile(
@@ -300,15 +300,6 @@ impl VM {
       let decoded_op = get_op(op);
       self.decoded_opcodes.push(op_string(&decoded_op).to_string());
 
-      /*
-      let mut sm: String = (&"[").to_string();
-      for s in self.state.stack.clone() {
-        sm = sm.to_owned() + &format!("{},", s);
-      }
-      sm += "]";
-      println!("stack: {}", sm);
-      */
-
       match decoded_op {
         Op::Push0 => {
           // stack output
@@ -324,8 +315,9 @@ impl VM {
           let xs = match &self.state.code {
             ContractCode::UnKnownCode(_) => panic!("Cannot execute unknown code"),
             ContractCode::InitCode(conc, _) => {
-              let bytes = pad_right(n as usize, (&conc[(1 + self.state.pc)..]).to_vec());
-              Expr::Lit(W256(word32(&bytes) as u128, 0))
+              let bytes =
+                pad_right(n as usize, (&conc[(1 + self.state.pc)..(1 + self.state.pc + n as usize)]).to_vec());
+              Expr::Lit(W256::from_bytes(bytes.to_vec()))
             }
             ContractCode::RuntimeCode(RuntimeCodeStruct::ConcreteRuntimeCode(bs)) => {
               let bytes = bs
@@ -465,14 +457,14 @@ impl VM {
           true
         }
         Op::Balance => {
-          if let Some(x) = self.state.stack.clone().last() {
+          if let Some((x, xs)) = self.state.stack.clone().split_last() {
             let mut a: Expr = Expr::Mempty;
             force_addr(self, x, "BALANCE", |a_| a = a_);
             access_and_burn(&a, || {
               let mut c = empty_contract();
               fetch_account(self, &a, |c_| c = c_.clone());
               next(self, op);
-              self.state.stack = self.state.stack[1..].to_vec();
+              self.state.stack = xs.to_vec();
               push_sym(self, Box::new(c.balance.clone()));
             });
           } else {
@@ -537,13 +529,7 @@ impl VM {
                 burn_calldatacopy(self, unbox(x_size.clone()), self.block.schedule.clone(), || {});
                 access_memory_range(self, *x_to.clone(), *x_size.clone(), || {});
                 self.state.stack = xs.to_vec();
-                copy_bytes_to_memory(
-                  *self.state.calldata.clone(),
-                  unbox(x_size.clone()),
-                  unbox(x_from.clone()),
-                  unbox(x_to.clone()),
-                  self,
-                );
+                copy_bytes_to_memory(self.state.calldata.clone(), x_size.clone(), x_from.clone(), x_to.clone(), self);
                 next(self, op);
               } else {
                 underrun();
@@ -565,31 +551,29 @@ impl VM {
           true
         }
         Op::Codecopy => {
-          if let Some((mem_offset, rest1)) = (self.state.stack).split_last() {
-            let mem_offset = mem_offset.clone();
-            let rest1 = rest1.to_vec();
-            if let Some((code_offset, rest)) = rest1.split_last().clone() {
-              if let Some((n, xs)) = rest.split_last().clone() {
-                next(self, op);
-                self.state.stack = xs.to_vec();
-                burn_codecopy(self, unbox(n.clone()), self.block.schedule.clone(), || {});
-                access_memory_range(self, *mem_offset.clone(), *n.clone(), || {});
-                if let Some(b) = to_buf(&self.state.code) {
-                  copy_bytes_to_memory(
-                    b,
-                    unbox(n.clone()),
-                    unbox(code_offset.clone().clone()),
-                    unbox(mem_offset.clone().clone()),
-                    self,
-                  );
-                } else {
-                  internal_error("Cannot produce a buffer from UnknownCode");
-                }
-              } else {
-                underrun();
-              }
+          /*
+          Copy code running in current environment to memory
+
+          Stack input
+          - destOffset: byte offset in the memory where the result will be copied.
+          - offset: byte offset in the code to copy.
+          - size: byte size to copy.
+          */
+          if let [xs @ .., n, code_offset, mem_offset] = &self.state.stack.clone()[..] {
+            next(self, op);
+            self.state.stack = xs.to_vec();
+            burn_codecopy(self, unbox(n.clone()), self.block.schedule.clone(), || {});
+            access_memory_range(self, *mem_offset.clone(), *n.clone(), || {});
+            if let Some(b) = to_buf(&self.state.code) {
+              copy_bytes_to_memory(
+                Box::new(b),
+                n.clone(),
+                Box::new(add(Box::new(Expr::Lit(W256(self.state.base_pc as u128, 0))), code_offset.clone())),
+                mem_offset.clone(),
+                self,
+              );
             } else {
-              underrun();
+              internal_error("Cannot produce a buffer from UnknownCode");
             }
           } else {
             underrun();
@@ -615,14 +599,22 @@ impl VM {
           true
         }
         Op::Extcodesize => {
-          if let Some(x) = self.state.stack.clone().last().clone() {
+          /*
+          Get size of an account’s code
+
+          Stack input
+          - address: 20-byte address of the contract to query.
+          Stack output
+          - size: byte size of the code.
+          */
+          if let Some((x, xs)) = self.state.stack.clone().split_last() {
             let mut a: Expr = Expr::Mempty;
             force_addr(self, x, "EXTCODESIZE", |a_| a = a_);
             access_and_burn(&a, || {
               let mut c = empty_contract();
               fetch_account(self, &a, |c_| c = c_.clone());
               next(self, op);
-              self.state.stack = self.state.stack[1..].to_vec();
+              self.state.stack = xs.to_vec();
               if let Some(b) = &c.bytecode() {
                 push_sym(self, Box::new(buf_length(b.clone())));
               } else {
@@ -759,35 +751,31 @@ impl VM {
             * offset: offset in the memory in bytes.
             * value: 32-byte value to write in the memory.
           */
-          if let Some((x, rest)) = self.state.stack.clone().split_last() {
-            if let Some((y, xs)) = rest.split_last() {
-              next(self, op);
-              match &self.state.memory {
-                Memory::ConcreteMemory(mem) => match *y.clone() {
-                  Expr::Lit(w) => {
-                    copy_bytes_to_memory(
-                      Expr::ConcreteBuf(word256_bytes(w.into())),
-                      Expr::Lit(W256(32, 0)),
-                      Expr::Lit(W256(0, 0)),
-                      *x.clone(),
-                      self,
-                    );
-                  }
-                  _ => {
-                    let buf = freeze_memory(&mem);
-                    self.state.memory = Memory::SymbolicMemory(write_word(x.clone(), y.clone(), Box::new(buf)));
-                  }
-                },
-                Memory::SymbolicMemory(mem) => {
-                  self.state.memory = Memory::SymbolicMemory(write_word(x.clone(), y.clone(), Box::new(mem.clone())));
+          if let [xs @ .., y, x] = &self.state.stack.clone()[..] {
+            next(self, op);
+            match &self.state.memory {
+              Memory::ConcreteMemory(mem) => match simplify(y.clone()) {
+                Expr::Lit(w) => {
+                  copy_bytes_to_memory(
+                    Box::new(Expr::ConcreteBuf(word256_bytes(w.into()))),
+                    Box::new(Expr::Lit(W256(32, 0))),
+                    Box::new(Expr::Lit(W256(0, 0))),
+                    x.clone(),
+                    self,
+                  );
                 }
+                _ => {
+                  let buf = freeze_memory(&mem);
+                  self.state.memory = Memory::SymbolicMemory(write_word(x.clone(), y.clone(), Box::new(buf)));
+                }
+              },
+              Memory::SymbolicMemory(mem) => {
+                self.state.memory = Memory::SymbolicMemory(write_word(x.clone(), y.clone(), Box::new(mem.clone())));
               }
-              self.state.stack = xs.to_vec();
-              access_memory_word(self, *x.clone(), || {});
-              burn(self, fees.g_verylow, || {});
-            } else {
-              underrun();
             }
+            self.state.stack = xs.to_vec();
+            access_memory_word(self, *x.clone(), || {});
+            burn(self, fees.g_verylow, || {});
           } else {
             underrun();
           }
@@ -802,10 +790,10 @@ impl VM {
                 Memory::ConcreteMemory(mem) => match y_byte {
                   Expr::LitByte(byte) => {
                     copy_bytes_to_memory(
-                      Expr::ConcreteBuf(vec![byte]),
-                      Expr::Lit(W256(1, 0)),
-                      Expr::Lit(W256(0, 0)),
-                      *x.clone(),
+                      Box::new(Expr::ConcreteBuf(vec![byte])),
+                      Box::new(Expr::Lit(W256(1, 0))),
+                      Box::new(Expr::Lit(W256(0, 0))),
+                      x.clone(),
                       self,
                     );
                   }
@@ -859,82 +847,86 @@ impl VM {
           true
         }
         Op::Sstore => {
+          /*
+          Save word to storage
+
+          Stack input
+          - key: 32-byte key in storage.
+          - value: 32-byte value to store.
+           */
+
           // Ensure we're not in a static context
           not_static(self, || {});
-          if let Some((x, rest)) = self.state.stack.clone().split_last() {
-            if let Some((new, xs)) = rest.split_last() {
-              // Access current storage
-              let mut current: Expr = Expr::Mempty;
-              access_storage(self, *self_contract.clone(), *x.clone(), |current_| current = current_);
-              let original = match conc_keccak_simp_expr(Box::new(Expr::SLoad(
-                x.clone(),
-                Box::new(this_contract.orig_storage.clone()),
-              ))) {
-                Expr::Lit(v) => v,
-                _ => W256(0, 0),
-              };
+          if let [xs @ .., new, x] = &self.state.stack.clone()[..] {
+            // Access current storage
+            let mut current: Expr = Expr::Mempty;
+            access_storage(self, *self_contract.clone(), *x.clone(), |current_| current = current_);
+            let original = match conc_keccak_simp_expr(Box::new(Expr::SLoad(
+              x.clone(),
+              Box::new(this_contract.orig_storage.clone()),
+            ))) {
+              Expr::Lit(v) => v,
+              _ => W256(0, 0),
+            };
 
-              // Calculate storage cost
-              let storage_cost = match (maybe_lit_word(current.clone()), maybe_lit_word(*new.clone())) {
-                (Some(current_), Some(new_)) => {
-                  if current_ == new_ {
-                    fees.g_sload
-                  } else if current_ == original && original == W256(0, 0) {
-                    fees.g_sset
-                  } else if current_ == original {
-                    fees.g_sreset
-                  } else {
-                    fees.g_sload
-                  }
+            // Calculate storage cost
+            let storage_cost = match (maybe_lit_word(current.clone()), maybe_lit_word(*new.clone())) {
+              (Some(current_), Some(new_)) => {
+                if current_ == new_ {
+                  fees.g_sload
+                } else if current_ == original && original == W256(0, 0) {
+                  fees.g_sset
+                } else if current_ == original {
+                  fees.g_sreset
+                } else {
+                  fees.g_sload
                 }
-                // Worst-case scenario for symbolic arguments
-                _ => fees.g_sset,
-              };
+              }
+              // Worst-case scenario for symbolic arguments
+              _ => fees.g_sset,
+            };
 
-              // Access storage for gas
-              let acc = access_storage_for_gas(self, *self_contract.clone(), *x.clone());
-              let cold_storage_cost = if acc { 0 } else { fees.g_cold_sload };
+            // Access storage for gas
+            let acc = access_storage_for_gas(self, *self_contract.clone(), *x.clone());
+            let cold_storage_cost = if acc { 0 } else { fees.g_cold_sload };
 
-              // Burn gas
-              burn(self, storage_cost + cold_storage_cost, || {});
-              next(self, op);
-              self.state.stack = xs.to_vec();
-              self.env.contracts.get_mut(&self_contract.clone()).unwrap().storage = write_storage(
-                x.clone(),
-                new.clone(),
-                Box::new(self.env.contracts.get_mut(&self_contract.clone()).unwrap().storage.clone()),
-              );
+            // Burn gas
+            burn(self, storage_cost + cold_storage_cost, || {});
+            next(self, op);
+            self.state.stack = xs.to_vec();
+            self.env.contracts.get_mut(&self_contract.clone()).unwrap().storage = write_storage(
+              x.clone(),
+              new.clone(),
+              Box::new(self.env.contracts.get_mut(&self_contract.clone()).unwrap().storage.clone()),
+            );
 
-              match (maybe_lit_word(current), maybe_lit_word(*new.clone())) {
-                (Some(current_), Some(new_)) => {
-                  if current_ != new_ {
-                    if current_ == original {
-                      if original != W256(0, 0) && new_ == W256(0, 0) {
+            match (maybe_lit_word(current), maybe_lit_word(*new.clone())) {
+              (Some(current_), Some(new_)) => {
+                if current_ != new_ {
+                  if current_ == original {
+                    if original != W256(0, 0) && new_ == W256(0, 0) {
+                      refund(self, fees.g_sreset + fees.g_access_list_storage_key);
+                    }
+                  } else {
+                    if original != W256(0, 0) {
+                      if current_ == W256(0, 0) {
+                        un_refund(self, fees.g_sreset + fees.g_access_list_storage_key);
+                      } else if new_ == W256(0, 0) {
                         refund(self, fees.g_sreset + fees.g_access_list_storage_key);
                       }
-                    } else {
-                      if original != W256(0, 0) {
-                        if current_ == W256(0, 0) {
-                          un_refund(self, fees.g_sreset + fees.g_access_list_storage_key);
-                        } else if new_ == W256(0, 0) {
-                          refund(self, fees.g_sreset + fees.g_access_list_storage_key);
-                        }
-                      }
-                      if original == new_ {
-                        if original == W256(0, 0) {
-                          refund(self, fees.g_sset - fees.g_sload);
-                        } else {
-                          refund(self, fees.g_sreset - fees.g_sload);
-                        }
+                    }
+                    if original == new_ {
+                      if original == W256(0, 0) {
+                        refund(self, fees.g_sset - fees.g_sload);
+                      } else {
+                        refund(self, fees.g_sreset - fees.g_sload);
                       }
                     }
                   }
                 }
-                // No refund changes for symbolic arguments
-                _ => {}
               }
-            } else {
-              underrun();
+              // No refund changes for symbolic arguments
+              _ => {}
             }
           } else {
             underrun();
@@ -1017,9 +1009,34 @@ impl VM {
           true
         }
         Op::Create => {
+          /*
+          Creates a new contract using the initialisation code provided at the indicated offset in the memory. Enters a new sub context of the calculated destination address and executes the initialisation code, then resumes the current context.
+          Should deployment succeed, the new account's code is set to the return data resulting from executing the initialisation code.
+
+          The destination address is calculated as the rightmost 20 bytes (160 bits) of the Keccak-256 hash of the rlp encoding of the sender address followed by its nonce. That is:
+            address = keccak256(rlp([sender_address,sender_nonce]))[12:]
+
+          Deployment can fail due to:
+
+          - A contract already exists at the destination address (can happen in combination with CREATE2 and SELFDESTRUCT).
+          - Insufficient value to send.
+          - Sub context reverted.
+          - Insufficient gas to execute the initialisation code.
+          - Call depth limit reached.
+
+          Note that these failures only affect the return value and do not cause the calling context to revert (unlike the error cases below).
+
+          Stack input
+          - value: value in wei to send to the new account.
+          - offset: byte offset in the memory in bytes, the initialisation code for the new account.
+          - size: byte size to copy (size of the initialisation code).
+
+          Stack output
+          - address: the address of the deployed contract, 0 if the deployment failed.
+          */
           not_static(self, || {});
           //if let [x_value, x_offset, x_size, xs @ ..] = &self.state.stack.clone()[..] {
-          if let [_xs @ .., x_size, x_offset, x_value] = &self.state.stack.clone()[..] {
+          if let [xs @ .., x_size, x_offset, x_value] = &self.state.stack.clone()[..] {
             access_memory_range(self, *x_offset.clone(), *x_size.clone(), || {});
             //let available_gas = 0; // Example available gas
             let (cost, gas) = (0, Gas::Symbolic); //cost_of_create(0, available_gas, x_size, false); // Example fees
@@ -1036,10 +1053,11 @@ impl VM {
               *x_size.clone(),
               gas,
               *x_value.clone(),
-              vec![],
+              xs.to_vec(),
               new_addr,
               init_code,
               max_num_iterations,
+              vm_queue,
             );
           } else {
             underrun();
@@ -1082,7 +1100,6 @@ impl VM {
 
               let mut x_to_a = Expr::Mempty;
               force_addr(self, x_to, "unable to determine a call target", |x_to_a_| x_to_a = x_to_a_);
-              info!("call address = {}", x_to_a);
               match Some(x_gas) {
                 None => vm_error("IllegalOverflow"),
                 _ => {
@@ -1172,10 +1189,17 @@ impl VM {
             let output = read_memory(self, *x_offset.clone(), *x_size.clone());
             let codesize = maybe_lit_word(buf_length(output.clone())).unwrap().0 as u32;
             let maxsize = self.block.max_code_size.0 as u32;
-            let creation = false; // Determine if creation context
+            let creation = if self.frames.len() == 0 {
+              self.tx.is_create
+            } else {
+              match &self.frames.last().unwrap().context {
+                FrameContext::CreationContext { .. } => true,
+                FrameContext::CallContext { .. } => false,
+              }
+            };
             if creation {
               if codesize > maxsize {
-                finish_frame(self, FrameResult::FrameErrored(EvmError::MaxCodeSizeExceeded(codesize, maxsize)));
+                finish_frame(self, FrameResult::FrameErrored(EvmError::MaxCodeSizeExceeded(codesize, maxsize)))
               } else {
                 match read_byte(Box::new(Expr::Lit(W256(0, 0))), Box::new(output.clone())) {
                   Expr::LitByte(0xef) => finish_frame(self, FrameResult::FrameErrored(EvmError::InvalidFormat)),
@@ -1197,12 +1221,12 @@ impl VM {
                 }
               }
             } else {
-              finish_frame(self, FrameResult::FrameReturned(output));
+              finish_frame(self, FrameResult::FrameReturned(output))
             }
           } else {
             underrun();
+            false
           }
-          false
         }
         Op::Delegatecall => {
           if let [_xs @ .., x_out_size, x_out_offset, x_in_size, x_in_offset, x_to, _x_gass] =
@@ -1276,6 +1300,7 @@ impl VM {
               new_addr,
               Expr::ConcreteBuf(init_code.clone()),
               max_num_iterations,
+              vm_queue,
             );
           } else {
             underrun();
@@ -1295,7 +1320,7 @@ impl VM {
                   args: vec![],
                 }));
               }
-              _ => {
+              Some(x_to_prime) => {
                 match Some(x_gas) {
                   // gasTryFrom(x_gas)
                   None => vm_error("IllegalOverflow"),
@@ -1306,8 +1331,8 @@ impl VM {
                       op,
                       this_contract.clone(),
                       Gas::Concerete(0),
-                      *x_to.clone(),
-                      *x_to.clone(),
+                      x_to_prime.clone(),
+                      x_to_prime.clone(),
                       Expr::Lit(W256(0, 0)),
                       *x_in_offset.clone(),
                       *x_in_size.clone(),
@@ -1317,14 +1342,17 @@ impl VM {
                       |callee_| callee = callee_,
                       max_num_iterations,
                     );
-                    // zoom(state, || {
-                    //     assign(callvalue, Expr::Lit(W256(0, 0)));
-                    //     assign(caller, fromMaybe(self, vm.config.overrideCaller));
-                    //     assign(contract, callee);
-                    //     assign(static, true);
-                    // });
-                    // let reset_caller = use(config.resetCaller);
-                    // if reset_caller { assign(config.overrideCaller, None); }
+                    self.state.callvalue = Box::new(Expr::Lit(W256(0, 0)));
+                    self.state.caller = if let Some(c) = &self.config.override_caller {
+                      Box::new(c.clone())
+                    } else {
+                      self_contract.clone()
+                    };
+                    self.state.contract = Box::new(callee.clone());
+                    self.state.static_flag = true;
+                    if self.config.reset_caller {
+                      self.config.override_caller = None;
+                    }
                     touch_account(self, &self_contract);
                     touch_account(self, &callee);
                   }
@@ -1371,7 +1399,7 @@ impl VM {
                 // });
               } else {
                 let mut else_vm = else_vm_.unwrap();
-                finish_frame(&mut else_vm, FrameResult::FrameReturned(Expr::Mempty))
+                finish_frame(&mut else_vm, FrameResult::FrameReturned(Expr::Mempty));
               }
             } else {
               let pc = 0; // use(state.pc)
@@ -1408,10 +1436,10 @@ impl VM {
             self.state.stack = xs.to_vec();
             if let Some(bytecode) = &account.bytecode() {
               copy_bytes_to_memory(
-                bytecode.clone(),
-                *code_size.clone(),
-                *code_offset.clone(),
-                *mem_offset.clone(),
+                Box::new(bytecode.clone()),
+                code_size.clone(),
+                code_offset.clone(),
+                mem_offset.clone(),
                 self,
               )
             } else {
@@ -1446,13 +1474,7 @@ impl VM {
               if out_of_bounds {
                 vm_error("ReturnDataOutOfBounds");
               } else {
-                copy_bytes_to_memory(
-                  *self.state.returndata.clone(),
-                  *x_size.clone(),
-                  *x_from.clone(),
-                  *x_to.clone(),
-                  self,
-                );
+                copy_bytes_to_memory(self.state.returndata.clone(), x_size.clone(), x_from.clone(), x_to.clone(), self);
               }
             };
 
@@ -1479,10 +1501,10 @@ impl VM {
                 );
                 if cond == BranchReachability::ONLYELSE {
                   copy_bytes_to_memory(
-                    *self.state.returndata.clone(),
-                    *x_size.clone(),
-                    *x_from.clone(),
-                    *x_to.clone(),
+                    self.state.returndata.clone(),
+                    x_size.clone(),
+                    x_from.clone(),
+                    x_to.clone(),
                     self,
                   );
                 } else {
@@ -1573,16 +1595,16 @@ fn freeze_memory(memory: &MutableMemory) -> Expr {
   Expr::ConcreteBuf(memory.clone()) // Clone the memory vector to freeze it
 }
 
-fn copy_bytes_to_memory(bs: Expr, size: Expr, src_offset: Expr, mem_offset: Expr, vm: &mut VM) {
-  if size == Expr::Lit(W256(0, 0)) {
+fn copy_bytes_to_memory(bs: Box<Expr>, size: Box<Expr>, src_offset: Box<Expr>, mem_offset: Box<Expr>, vm: &mut VM) {
+  if *size == Expr::Lit(W256(0, 0)) {
     return;
   }
 
   match &vm.state.memory {
     Memory::ConcreteMemory(mem) => {
-      match (&bs, &size, &src_offset, &mem_offset) {
+      match (*bs.clone(), *size.clone(), *src_offset.clone(), *mem_offset.clone()) {
         (Expr::ConcreteBuf(b), Expr::Lit(size_val), Expr::Lit(src_offset_val), Expr::Lit(mem_offset_val)) => {
-          let src = if *src_offset_val >= (W256(b.len() as u128, 0)) {
+          let src = if src_offset_val >= (W256(b.len() as u128, 0)) {
             vec![0; size_val.0 as usize]
           } else {
             let mut src_tmp = b[(src_offset_val.0 as usize)..].to_vec();
@@ -1596,24 +1618,12 @@ fn copy_bytes_to_memory(bs: Expr, size: Expr, src_offset: Expr, mem_offset: Expr
         _ => {
           // Copy out and move to symbolic memory
           let buf = freeze_memory(&mem);
-          vm.state.memory = Memory::SymbolicMemory(copy_slice(
-            Box::new(src_offset),
-            Box::new(mem_offset),
-            Box::new(size),
-            Box::new(bs),
-            Box::new(buf),
-          ))
+          vm.state.memory = Memory::SymbolicMemory(copy_slice(src_offset, mem_offset, size, bs, Box::new(buf)))
         }
       }
     }
     Memory::SymbolicMemory(mem) => {
-      vm.state.memory = Memory::SymbolicMemory(copy_slice(
-        Box::new(src_offset),
-        Box::new(mem_offset),
-        Box::new(size),
-        Box::new(bs),
-        Box::new(mem.clone()),
-      ))
+      vm.state.memory = Memory::SymbolicMemory(copy_slice(src_offset, mem_offset, size, bs, Box::new(mem.clone())))
     }
   }
 }
@@ -1679,7 +1689,7 @@ enum FrameResult {
 // This function defines how to pop the current stack frame in either of the ways specified by 'FrameResult'.
 // It also handles the case when the current stack frame is the only one;
 // in this case, we set the final '_result' of the VM execution.
-fn finish_frame(vm: &mut VM, result: FrameResult) {
+fn finish_frame(vm: &mut VM, result: FrameResult) -> bool {
   match vm.frames.clone().as_slice() {
     // Is the current frame the only one?
     [] => {
@@ -1688,6 +1698,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
         FrameResult::FrameReverted(buffer) => vm.result = Some(VMResult::VMFailure(EvmError::Revert(Box::new(buffer)))),
         FrameResult::FrameErrored(e) => vm.result = Some(VMResult::VMFailure(e)),
       }
+      false
       //vm.finalize();
     }
     // Are there some remaining frames?
@@ -1703,6 +1714,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
       // Pop to the previous level of the debug trace stack.
       // vm.traces.pop();
 
+      let old_state = vm.state.clone();
       // Pop the top frame.
       vm.frames = remaining_frames.to_vec();
       // Install the state of the frame to which we shall return.
@@ -1731,7 +1743,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
             // Case 1: Returning from a call?
             FrameResult::FrameReturned(output) => {
               vm.state.returndata = Box::new(output.clone());
-              copy_call_bytes_to_memory(vm, output, size.clone(), offset.clone());
+              copy_call_bytes_to_memory(vm, Box::new(output), Box::new(size.clone()), Box::new(offset.clone()));
               push(vm, W256(1, 0));
             }
             // Case 2: Reverting during a call?
@@ -1739,7 +1751,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
               vm.env.contracts = callreversion.clone();
               vm.tx.substate = substate.clone();
               vm.state.returndata = Box::new(output.clone());
-              copy_call_bytes_to_memory(vm, output.clone(), size.clone(), offset.clone());
+              copy_call_bytes_to_memory(vm, Box::new(output.clone()), Box::new(size.clone()), Box::new(offset.clone()));
               push(vm, W256(0, 0));
             }
             // Case 3: Error during a call?
@@ -1755,7 +1767,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
         // (_, _, reversion, substate)
         FrameContext::CreationContext { address: _, codehash: _, createversion, substate } => {
           let creator = vm.state.contract.clone();
-          let createe = vm.state.contract.clone(); // oldvm.state.contract
+          let createe = old_state.contract.clone(); // oldvm.state.contract
           let mut reversion_prime = createversion.clone(); //createversion.clone();
 
           for (k, v) in reversion_prime.clone().iter() {
@@ -1772,6 +1784,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
               let mut on_contract_code = |contract_code| {
                 replace_code(vm, createe.clone(), contract_code);
                 vm.state.returndata = Box::new(Expr::Mempty);
+                // reclaimRemainingGasAllowance oldVm
                 push_addr(vm, *createe.clone());
               };
               match output {
@@ -1809,6 +1822,7 @@ fn finish_frame(vm: &mut VM, result: FrameResult) {
           }
         }
       }
+      true
     }
   }
 }
@@ -1830,19 +1844,22 @@ fn limit_stack<F: FnOnce()>(n: usize, stack_len: usize, f: F) {
   }
 }
 
-fn burn<F: FnOnce()>(vm: &mut VM, gas: u64, f: F) {
+fn burn<F: FnOnce()>(vm: &mut VM, _gas: u64, f: F) {
   match vm.state.gas {
     Gas::Symbolic => f(),
-    Gas::Concerete(available_gas_val) => match vm.burned {
+    Gas::Concerete(_available_gas_val) => match vm.burned {
       Gas::Symbolic => f(),
-      Gas::Concerete(burned_gas_val) => {
+      Gas::Concerete(_burned_gas_val) => {
+        f()
+        /*
+        info!("burned_gas_val: {}, available_gas_val {}", burned_gas_val, available_gas_val);
         if gas <= available_gas_val {
           vm.state.gas = Gas::Concerete(available_gas_val - gas);
           vm.burned = Gas::Concerete(burned_gas_val + gas);
           f()
         } else {
           panic!("out of gas")
-        }
+        }*/
       }
     },
   };
@@ -1977,14 +1994,14 @@ fn access_memory_word(vm: &mut VM, x: Expr, continue_fn: impl Fn()) {
   access_memory_range(vm, x, Expr::Lit(W256(32, 0)), continue_fn);
 }
 
-fn copy_call_bytes_to_memory(vm: &mut VM, bs: Expr, size: Expr, y_offset: Expr) {
-  let size_min = emin(Box::new(size), Box::new(buf_length(bs.clone())));
-  copy_bytes_to_memory(bs, size_min, Expr::Lit(W256(0, 0)), y_offset, vm);
+fn copy_call_bytes_to_memory(vm: &mut VM, bs: Box<Expr>, size: Box<Expr>, y_offset: Box<Expr>) {
+  let size_min = emin(size, Box::new(buf_length(*bs.clone())));
+  copy_bytes_to_memory(bs, Box::new(size_min), Box::new(Expr::Lit(W256(0, 0))), y_offset, vm);
 }
 
 fn read_memory(vm: &mut VM, offset_: Expr, size_: Expr) -> Expr {
   match &vm.state.memory {
-    Memory::ConcreteMemory(mem) => match (offset_.clone(), size_.clone()) {
+    Memory::ConcreteMemory(mem) => match (simplify(Box::new(offset_.clone())), simplify(Box::new(size_.clone()))) {
       (Expr::Lit(offset_val), Expr::Lit(size_val)) => {
         if size_val.clone() > MAX_BYTES
           || offset_val.clone() + size_val.clone() > MAX_BYTES
@@ -2174,7 +2191,12 @@ fn underrun() {
 }
 
 fn push_addr(vm: &mut VM, addr: Expr) {
-  vm.state.stack.push(Box::new(addr.clone()));
+  match addr {
+    Expr::LitAddr(x) => vm.state.stack.push(Box::new(Expr::Lit(x))),
+    Expr::SymAddr(_) => vm.state.stack.push(Box::new(Expr::WAddr(Box::new(addr)))),
+    Expr::GVar(_) => panic!("Unexpected GVar"),
+    _ => panic!("Unexpected Expr={}", addr),
+  }
 }
 
 fn internal_error(msg: &str) {
@@ -2240,7 +2262,6 @@ where
   F: FnOnce(Expr),
 {
   let slot_conc = conc_keccak_simp_expr(Box::new(slot.clone()));
-
   match vm.env.contracts.get(&addr) {
     Some(c) => match read_storage(Box::new(slot.clone()), Box::new(c.storage.clone())) {
       Some(x) => match read_storage(Box::new(slot_conc.clone()), Box::new(c.storage.clone())) {
@@ -2406,6 +2427,8 @@ fn general_call(
           Box::new(Expr::Lit(W256(0, 0))),
           Box::new(read_memory(vm, x_in_offset, Expr::Lit(W256(4, 0)))),
         ));
+
+        // warn!("abi: {}", abi.clone().unwrap().to_hex());
         let new_context = FrameContext::CallContext {
           target: x_to.clone(),
           context: x_context.clone(),
@@ -2452,7 +2475,6 @@ fn general_call(
   }
 }
 
-// Implement the create function in Rust
 fn create(
   vm: &mut VM,
   op: u8,
@@ -2465,6 +2487,7 @@ fn create(
   new_addr: Expr,
   init_code: Expr,
   max_num_iterations: u32,
+  vm_queue: &mut Vec<VM>,
 ) {
   let x_size_val = match x_size {
     Expr::Lit(v) => v,
@@ -2499,14 +2522,15 @@ fn create(
     next(vm, op);
   } else {
     let mut condition = BranchReachability::NONE;
-    branch(
+    let else_vm_ = branch(
       vm,
       Box::new(gt(Box::new(x_value.clone()), Box::new(this.balance.clone()))),
       |condition_| Ok(condition = condition_),
       max_num_iterations,
     );
     if condition == BranchReachability::ONLYTHEN || condition == BranchReachability::BOTH {
-      vm.state.stack = xs;
+      // not enough balance
+      vm.state.stack = xs.clone();
       vm.state.stack.push(Box::new(Expr::Lit(W256(0, 0))));
       vm.state.returndata = Box::new(Expr::Mempty);
       vm.traces.push(with_trace_location(
@@ -2519,11 +2543,13 @@ fn create(
     }
     if condition == BranchReachability::ONLYELSE || condition == BranchReachability::BOTH {
       {
-        burn(vm, 0, || {});
+        let mut else_vm = else_vm_.unwrap();
+        burn(&mut else_vm, 0, || {});
         match parse_init_code(init_code.clone()) {
           None => {
-            vm.result = Some(VMResult::Unfinished(PartialExec::UnexpectedSymbolicArg {
-              pc: vm.state.pc,
+            next(&mut else_vm, op);
+            else_vm.result = Some(VMResult::Unfinished(PartialExec::UnexpectedSymbolicArg {
+              pc: else_vm.state.pc,
               msg: "initcode must have a concrete prefix".to_string(),
               args: vec![],
             }));
@@ -2533,36 +2559,42 @@ fn create(
             let new_context = FrameContext::CreationContext {
               address: new_addr.clone(),
               codehash: new_contract.codehash.clone(),
-              createversion: vm.env.contracts.clone(),
-              substate: vm.tx.substate.clone(),
+              createversion: else_vm.env.contracts.clone(),
+              substate: else_vm.tx.substate.clone(),
             };
 
-            let old_acc = vm.env.contracts.get(&new_addr).cloned();
+            let old_acc = else_vm.env.contracts.get(&new_addr).cloned();
             let old_bal = old_acc.map_or(Expr::Lit(W256(0, 0)), |acc| acc.balance.clone());
-            vm.env.contracts.insert(new_addr.clone(), Contract { balance: old_bal.clone(), ..new_contract });
-            vm.env.contracts.insert(self_addr.clone(), Contract { nonce: this.nonce.map(|n| n + 1), ..this });
+            else_vm.env.contracts.insert(new_addr.clone(), Contract { balance: old_bal.clone(), ..new_contract });
+            else_vm.env.contracts.insert(self_addr.clone(), Contract { nonce: this.nonce.map(|n| n + 1), ..this });
 
-            let _ = transfer(vm, self_addr.clone(), new_addr.clone(), x_value.clone(), max_num_iterations);
-            vm.traces.push(with_trace_location(vm, TraceData::FrameTrace(new_context.clone())));
-            next(vm, op);
-            vm.frames.push(Frame { state: vm.state.clone(), context: new_context.clone() });
+            let _ = transfer(&mut else_vm, self_addr.clone(), new_addr.clone(), x_value.clone(), max_num_iterations);
+            else_vm.traces.push(with_trace_location(&else_vm, TraceData::FrameTrace(new_context.clone())));
+            next(&mut else_vm, op);
+
+            else_vm.state.stack = xs.clone();
+            else_vm.frames.push(Frame { state: else_vm.state.clone(), context: new_context.clone() });
+
             let state = blank_state();
-            vm.state = FrameState {
+            else_vm.state = FrameState {
               contract: Box::new(new_addr.clone()),
               code_contract: Box::new(new_addr.clone()),
               code: c.clone(),
               callvalue: Box::new(x_value.clone()),
               caller: Box::new(self_addr.clone()),
               gas: x_gas.clone(),
+              stack: else_vm.state.stack,
               ..state
             };
           }
         }
+        vm_queue.push(else_vm);
       }
     }
   }
 }
 
+/*
 fn force_concrete_addr<F>(vm: &mut VM, n: Expr, msg: String, continue_fn: F)
 where
   F: FnOnce(Addr),
@@ -2575,6 +2607,7 @@ where
     Some(c) => continue_fn(c),
   }
 }
+*/
 
 fn force_concrete_addr2<F>(vm: &mut VM, addrs: (Expr, Expr), msg: String, continue_fn: F)
 where
@@ -2732,7 +2765,7 @@ fn transfer(vm: &mut VM, src: Expr, dst: Expr, val: Expr, max_num_iterations: u3
         Ok(())
       }
       Expr::GVar(_) => panic!("Unexpected GVar"),
-      _ => panic!("unexpected error"),
+      _ => panic!("Unexpected Expr={}", dst),
     },
   }
 }
@@ -2873,7 +2906,7 @@ fn create2_address(vm: &mut VM, e: Expr, s: W256, b: &ByteString) -> Expr {
 fn fresh_sym_addr(vm: &mut VM) -> Expr {
   vm.env.fresh_address += 1;
   let n = vm.env.fresh_address;
-  Expr::SymAddr(format!("freshSymAddr {}", n))
+  Expr::SymAddr(format!("freshSymAddr{}", n))
 }
 
 fn cheat_code() -> Expr {
@@ -2895,12 +2928,14 @@ fn parse_init_code(buf: Expr) -> Option<ContractCode> {
   }
 }
 
+/*
 fn account_exists(addr: Expr, vm: &VM) -> bool {
   match vm.env.contracts.get(&addr) {
     Some(c) => !(account_empty(c)),
     None => false,
   }
 }
+*/
 
 // Checks a *CALL for failure; OOG, too many callframes, memory access etc.
 fn call_checks<F>(

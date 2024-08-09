@@ -289,7 +289,18 @@ pub fn not(x: Box<Expr>) -> Expr {
 }
 
 pub fn shl(x: Box<Expr>, y: Box<Expr>) -> Expr {
-  op2(Expr::SHL, |x, y| if x > W256(256, 0) { W256(0, 0) } else { y << x.0 as u32 }, x, y)
+  op2(
+    Expr::SHL,
+    |x, y| {
+      if x > W256(256, 0) {
+        W256(0, 0)
+      } else {
+        y << (x.0 as u32)
+      }
+    },
+    x,
+    y,
+  )
 }
 
 pub fn shr(x: Box<Expr>, y: Box<Expr>) -> Expr {
@@ -299,7 +310,7 @@ pub fn shr(x: Box<Expr>, y: Box<Expr>) -> Expr {
       if x > W256(256, 0) {
         W256(0, 0)
       } else {
-        y >> x.0 as u32
+        y >> (x.0 as u32)
       }
     },
     x,
@@ -418,7 +429,7 @@ pub fn index_word(i: Box<Expr>, w: Box<Expr>) -> Expr {
     }
     (Expr::Lit(idx), Expr::Lit(w)) => {
       if idx <= W256(31, 0) {
-        Expr::LitByte((w >> (unsafe_into_usize(idx) * 8) as u32).0 as u8)
+        Expr::LitByte((w >> (idx.0 * 8) as u32).0 as u8)
       } else {
         Expr::LitByte(0)
       }
@@ -524,7 +535,7 @@ pub fn read_byte(idx: Box<Expr>, buf: Box<Expr>) -> Expr {
 pub fn read_bytes(n: usize, idx: Box<Expr>, buf: Box<Expr>) -> Expr {
   let n = min(32, n);
   let bytes: Vec<Expr> = (0..n)
-    .map(|i| read_byte(Box::new(add(idx.clone(), Box::new(Expr::Lit(W256(0, i as u128))))), buf.clone()))
+    .map(|i| read_byte(Box::new(add(idx.clone(), Box::new(Expr::Lit(W256(i as u128, 0))))), buf.clone()))
     .collect();
   join_bytes(bytes)
 }
@@ -543,12 +554,21 @@ fn bytes_to_w256(bytes: &[u8]) -> W256 {
     return None; // Ensure the byte slice is exactly 32 bytes
   }*/
 
-  // Convert the first 16 bytes to the low u128
-  let low = u128::from_be_bytes(bytes[0..16].try_into().unwrap());
-  // Convert the last 16 bytes to the high u128
-  let high = u128::from_be_bytes(bytes[16..32].try_into().unwrap());
+  if bytes.len() < 16 {
+    let mut low_padded_bytes = [0u8; 16];
+    low_padded_bytes[16 - bytes.len()..].copy_from_slice(bytes);
+    let low = u128::from_be_bytes(low_padded_bytes);
+    W256(low, 0)
+  } else if bytes.len() < 32 {
+    todo!()
+  } else {
+    // Convert the first 16 bytes to the low u128
+    let low = u128::from_be_bytes(bytes[0..16].try_into().unwrap());
+    // Convert the last 16 bytes to the high u128
+    let high = u128::from_be_bytes(bytes[16..32].try_into().unwrap());
 
-  W256(low, high)
+    W256(low, high)
+  }
 }
 
 fn pad_bytes_left(n: usize, mut bs: Vec<Expr>) -> Vec<Expr> {
@@ -669,7 +689,7 @@ pub fn read_word_from_bytes(idx: Box<Expr>, buf: Box<Expr>) -> Box<Expr> {
     return Box::new(Expr::Lit(W256::from_bytes(padded.try_into().unwrap())));
   }
   let bytes: Vec<Expr> =
-    (0..32).map(|i| read_byte(Box::new(add(idx.clone(), Box::new(Expr::Lit(W256(i, 0))))), buf.clone())).collect();
+    (0..3).map(|i| read_byte(Box::new(add(idx.clone(), Box::new(Expr::Lit(W256(i, 0))))), buf.clone())).collect();
   if bytes.iter().all(|b| matches!(b, Expr::Lit(_))) {
     let result = bytes.into_iter().map(|b| if let Expr::Lit(byte) = b { byte.0 as u8 } else { 0 }).collect::<Vec<u8>>();
     Box::new(Expr::Lit(W256::from_bytes(result)))
@@ -1147,8 +1167,15 @@ fn go_expr(expr: Box<Expr>) -> Expr {
     Expr::SLT(a, b) => slt(a, b),
     Expr::SGT(a, b) => sgt(a, b),
 
-    Expr::IsZero(a) => iszero(a),
-
+    // TODO: check its correctness
+    Expr::IsZero(a) => match *a.clone() {
+      Expr::WAddr(b) => match *b.clone() {
+        Expr::SymAddr(_) => Expr::Lit(W256(0, 0)),
+        _ => iszero(a),
+      },
+      _ => iszero(a),
+    },
+    // Expr::IsZero(a) => iszero(a),
     Expr::Xor(a_, b_) => match (*a_.clone(), *b_.clone()) {
       (Expr::Lit(a), Expr::Lit(b)) => Expr::Lit(a ^ b),
       _ => xor(a_.clone(), b_.clone()),
@@ -1169,6 +1196,7 @@ fn go_expr(expr: Box<Expr>) -> Expr {
     Expr::And(a_, b_) => match (*a_.clone(), *b_.clone()) {
       (Expr::Lit(a), Expr::Lit(b)) => Expr::Lit(a & b),
       (Expr::Lit(W256(0, 0)), _) => Expr::Lit(W256(0, 0)),
+      (Expr::Lit(W256(0xffffffffffffffffffffffffffffffff, 0xffffffff)), Expr::WAddr(_)) => *b_.clone(),
       _ => and(a_, b_),
     },
 
@@ -1183,7 +1211,20 @@ fn go_expr(expr: Box<Expr>) -> Expr {
       _ => not(a_),
     },
 
-    Expr::Div(a, b) => div(a, b),
+    /*
+        go (Div (Lit 0) _) = Lit 0 -- divide 0 by anything (including 0) is zero in EVM
+    go (Div _ (Lit 0)) = Lit 0 -- divide anything by 0 is zero in EVM
+    go (Div a (Lit 1)) = a
+     */
+    Expr::Div(a_, b_) => match (*a_.clone(), *b_.clone()) {
+      (Expr::Lit(W256(0, 0)), _) => Expr::Lit(W256(0, 0)),
+      (_, Expr::Lit(W256(0, 0))) => Expr::Lit(W256(0, 0)),
+      (a, Expr::Lit(W256(1, 0))) => a,
+      (Expr::Mul(c, d), e) if *c.clone() == e => *d.clone(),
+      (Expr::Mul(c, d), e) if *d.clone() == e => *c.clone(),
+      (_, _) => div(a_, b_),
+    },
+
     Expr::SDiv(a, b) => sdiv(a, b),
     Expr::Mod(a_, b_) => match (*a_.clone(), *b_.clone()) {
       (Expr::Lit(_), Expr::Lit(_)) => r#mod(a_, b_),
@@ -1695,18 +1736,18 @@ pub fn concrete_prefix(b: Box<Expr>) -> Vec<u8> {
     false
   }
 
-  fn go(b: Box<Expr>, i: i32, v: Vec<u8>) -> (i32, Vec<u8>) {
+  fn go(b: Box<Expr>, i: i32, mut v: Vec<u8>) -> (i32, Vec<u8>) {
     if i >= max_idx() {
       panic!("concrete prefix: prefix size exceeds 500mb");
     } else if has_enough_concrete_size(i, b.clone()) {
       (i, v)
     } else if i as usize >= v.len() {
-      // grow v double
+      v.resize(v.len() * 2, 0);
       go(b, i, v)
     } else {
       match read_byte(Box::new(Expr::Lit(W256(i as u128, 0))), b.clone()) {
         Expr::LitByte(byte) => {
-          // write v i byte
+          v[i as usize] = byte;
           go(b, i + 1, v)
         }
         _ => (i, v),
@@ -1715,7 +1756,7 @@ pub fn concrete_prefix(b: Box<Expr>) -> Vec<u8> {
   }
 
   let v_size = if let Some(w) = input_len(b.clone()) { w.0 } else { 1024 };
-  let v = vec![];
+  let v = vec![0; v_size as usize];
   let result = go(b.clone(), 0, v);
   result.1
 }
@@ -1818,7 +1859,6 @@ pub fn word_to_addr(e: Box<Expr>) -> Option<Expr> {
       _ => None,
     }
   }
-  info!("simplify(e)={}", simplify(e.clone()));
   go(Box::new(simplify(e)))
 }
 
@@ -1866,4 +1906,20 @@ pub fn buf_length_env(env: &HashMap<usize, Expr>, use_env: bool, buf: Expr) -> E
   }
 
   go(Expr::Lit(W256(0, 0)), buf, &env, use_env)
+}
+
+pub fn is_function_sig_check_prop(prop: &Prop) -> bool {
+  match prop {
+    Prop::PNeg(p1) => match *p1.clone() {
+      Prop::PEq(Expr::Eq(e1, e2), Expr::Lit(W256(0, 0))) => match (*e1.clone(), *e2.clone()) {
+        (Expr::Lit(w), Expr::SHR(e3, _)) => match *e3.clone() {
+          Expr::Lit(W256(0xe0, 0)) => w.to_hex().len() <= 8,
+          _ => false,
+        },
+        _ => false,
+      },
+      _ => false,
+    },
+    _ => false,
+  }
 }
